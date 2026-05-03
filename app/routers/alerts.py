@@ -8,7 +8,8 @@ from app.database import get_db
 from app.models.db_models import User, Alert, AlertStatus
 from app.models.schemas import AlertOut, AlertActionRequest, AssignAlertRequest
 from app.services.auth_service import get_current_user, require_supervisor
-
+from app.models.schemas import AlertOut, AlertActionRequest, AssignAlertRequest, BroadcastAlertRequest
+from app.services.notification_service import notification_service
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
 
 
@@ -109,6 +110,30 @@ async def assign_alert(
     db.add(alert)
     return alert
 
+@router.post("/broadcast", status_code=204)
+async def broadcast_alert_to_operators(
+    payload: BroadcastAlertRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_supervisor),
+):
+    """Supervisor mengirim pesan broadcast ke semua operator aktif."""
+    result = await db.execute(
+        select(User).where(
+            User.role == "operator",
+            User.is_active == True,
+            User.fcm_token.is_not(None),
+        )
+    )
+    operators = result.scalars().all()
+    tokens = [u.fcm_token for u in operators]
+
+    if tokens:
+        await notification_service.broadcast_alert(
+            tokens,
+            title=f"📢 Broadcast dari {current_user.name}",
+            body=payload.message,
+            data={"type": "broadcast", "severity": payload.severity},
+        )
 
 async def _get_alert_or_404(alert_id: int, db: AsyncSession) -> Alert:
     result = await db.execute(

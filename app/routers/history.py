@@ -49,7 +49,9 @@ async def get_history(
     durations = []
     for a in alerts:
         if a.resolved_at and a.detected_at:
-            durations.append((a.resolved_at - a.detected_at).total_seconds() / 60)
+            dur = (a.resolved_at - a.detected_at).total_seconds() / 60
+            if dur <= 480:  # exclude > 8 jam (kemungkinan data kotor)
+                durations.append(dur)
 
     avg_duration = round(sum(durations) / len(durations), 1) if durations else 0
 

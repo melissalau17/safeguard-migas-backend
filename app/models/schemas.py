@@ -103,7 +103,9 @@ class AlertActionRequest(BaseModel):
 class AssignAlertRequest(BaseModel):
     user_id: int
     note: Optional[str] = None
-
+class BroadcastAlertRequest(BaseModel):
+    message: str
+    severity: str = "info"   # info / warning / critical
 
 # ── Drift ─────────────────────────────────────────────────────────────────────
 class DriftVariableStatus(BaseModel):

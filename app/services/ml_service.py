@@ -19,6 +19,132 @@ from scipy.stats import ks_2samp, entropy as scipy_entropy
 from app.config import settings
 from app.models.db_models import AlertSeverity
 
+import torch
+import torch.nn.functional as nn_F
+import numpy as np
+import sys
+import types
+
+class TepEnsembleWrapper:
+    def __init__(self, cnn_model, af_model, scaler, window, n_feat, n_class, device):
+        self.cnn    = cnn_model
+        self.af     = af_model
+        self.scaler = scaler
+        self.window = window
+        self.n_feat = n_feat
+        self.device = device
+        self.classes_ = np.array(
+            ['Normal'] + [f'Fault{i}' for i in range(1, n_class)]
+        )
+
+    def _make_window_tensor(self, X_flat, fmt):
+        N = X_flat.shape[0]
+        if N < self.window:
+            pad    = np.zeros((self.window - N, self.n_feat), dtype=np.float32)
+            X_flat = np.vstack([pad, X_flat])
+        else:
+            X_flat = X_flat[-self.window:]
+        X_scaled = self.scaler.transform(X_flat)
+        X_win    = X_scaled[np.newaxis].astype(np.float32)
+        X_t      = torch.tensor(X_win)
+        if fmt == 'cnn':
+            X_t = X_t.permute(0, 2, 1)
+        return X_t
+
+    def predict_proba(self, X):
+        X = np.array(X, dtype=np.float32)
+        with torch.no_grad():
+            p_cnn = nn_F.softmax(self.cnn(self._make_window_tensor(X, 'cnn')), dim=-1).cpu()
+            p_af  = nn_F.softmax(self.af(self._make_window_tensor(X, 'seq')), dim=-1).cpu()
+        return ((p_cnn + p_af) / 2).numpy()
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+import torch.nn as nn
+
+WINDOW  = 20
+N_FEAT  = 52
+N_CLASS = 21
+
+class CNN_LSTM_TEP(nn.Module):
+    def __init__(self, window=WINDOW, n_feat=N_FEAT, n_class=N_CLASS):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(n_feat, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.2),
+        )
+        self.lstm1      = nn.LSTM(128, 128, batch_first=True, dropout=0.1)
+        self.drop_lstm1 = nn.Dropout(0.2)
+        self.lstm2      = nn.LSTM(128, 64,  batch_first=True)
+        self.drop_lstm2 = nn.Dropout(0.2)
+        self.head       = nn.Sequential(
+            nn.Linear(64, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, n_class)
+        )
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = x.permute(0, 2, 1)
+        x, _ = self.lstm1(x)
+        x = self.drop_lstm1(x)
+        x, _ = self.lstm2(x)
+        x = x[:, -1, :]
+        x = self.drop_lstm2(x)
+        return self.head(x)
+
+
+class Autoformer_TEP(nn.Module):
+    def __init__(self, n_feat=N_FEAT, d_model=128, n_heads=4,
+                 n_lstm_layers=1, n_tf_layers=2,
+                 dim_ff=256, n_class=N_CLASS,
+                 dropout=0.1, max_len=WINDOW):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(n_feat, d_model),
+            nn.LayerNorm(d_model)
+        )
+        self.lstm = nn.LSTM(
+            input_size=d_model, hidden_size=d_model,
+            num_layers=n_lstm_layers, batch_first=True,
+            dropout=dropout if n_lstm_layers > 1 else 0.0,
+            bidirectional=False
+        )
+        self.lstm_norm    = nn.LayerNorm(d_model)
+        self.lstm_dropout = nn.Dropout(dropout)
+        self.pos_emb      = nn.Embedding(max_len, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=dim_ff, dropout=dropout,
+            batch_first=True, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_tf_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, n_class)
+        )
+    def forward(self, x):
+        B, W, _ = x.shape
+        x = self.input_proj(x)
+        x, _ = self.lstm(x)
+        x = self.lstm_norm(x)
+        x = self.lstm_dropout(x)
+        pos = torch.arange(W, device=x.device).unsqueeze(0)
+        x = x + self.pos_emb(pos)
+        x = self.transformer(x)
+        x = x.mean(dim=1)
+        return self.head(x)
+
 # ── TEP Variable Metadata ─────────────────────────────────────────────────────
 XMEAS_META = {
     1:  ("A Feed Flow",        "kscmh",  (0.20, 0.26)),
@@ -99,6 +225,8 @@ class MLService:
 
     def load(self):
         """Load model artifacts. Call once on startup."""
+        import pickle
+
         model_path = Path(settings.MODEL_PATH)
         scaler_path = Path(settings.SCALER_PATH)
 
@@ -107,7 +235,33 @@ class MLService:
             self._loaded = False
             return
 
+        # ── Custom Unpickler ──────────────────────────────────
+        _class_map = {
+            'TepEnsembleWrapper': TepEnsembleWrapper,
+            'CNN_LSTM_TEP':       CNN_LSTM_TEP,
+            'Autoformer_TEP':     Autoformer_TEP,
+        }
+
+        class SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if name in _class_map:
+                    return _class_map[name]
+                return super().find_class(module, name)
+
+        import joblib.numpy_pickle as jnp
+        original_unpickler = jnp.NumpyUnpickler
+
+        class PatchedNumpyUnpickler(original_unpickler):
+            def find_class(self, module, name):
+                if name in _class_map:
+                    return _class_map[name]
+                return super().find_class(module, name)
+
+        jnp.NumpyUnpickler = PatchedNumpyUnpickler
         self.model = joblib.load(model_path)
+        jnp.NumpyUnpickler = original_unpickler
+        # ── End Custom Unpickler ──────────────────────────────
+
         if scaler_path.exists():
             self.scaler = joblib.load(scaler_path)
 
@@ -115,7 +269,6 @@ class MLService:
         if label_path.exists():
             self.label_encoder = joblib.load(label_path)
 
-        # Load training baseline for drift detection
         baseline_path = Path("ml/training_baseline.npy")
         if baseline_path.exists():
             self.training_baseline = np.load(baseline_path)
@@ -265,6 +418,5 @@ class MLService:
             ],
             "top_variables": self._top_variables(xmeas),
         }
-
 
 ml_service = MLService()

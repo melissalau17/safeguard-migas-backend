@@ -1,12 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 from app.config import settings
 from app.database import init_db
 from app.services.ml_service import ml_service
 from app.services.notification_service import notification_service
-from app.routers import auth, predict, alerts, dashboard, drift, history
-
+from app.services.sensor_simulator import run_simulator
+from app.routers import auth, predict, alerts, dashboard, drift, history, metrics
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -15,6 +16,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     ml_service.load()
     notification_service.init()
+    # Jalankan simulator sebagai background task
+    asyncio.create_task(run_simulator(interval_seconds=5))
     print("✅ All services ready")
     yield
     # ── Shutdown ───────────────────────────────────────────
@@ -28,22 +31,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow Flutter app (update origins in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Routers
 app.include_router(auth.router)
 app.include_router(predict.router)
 app.include_router(alerts.router)
 app.include_router(dashboard.router)
 app.include_router(drift.router)
 app.include_router(history.router)
+app.include_router(metrics.router)
 
 
 @app.get("/", tags=["Health"])
